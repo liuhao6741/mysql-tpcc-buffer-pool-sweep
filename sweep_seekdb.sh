@@ -16,9 +16,10 @@
 #
 # Config (override via env):
 #   SIZES_GIB="40 60 80 100 110"   memory_limit values to sweep
-#   NUM_VU=80                       virtual users
+#   NUM_VU=200                       virtual users
 #   RAMPUP_MIN=10 DURATION_MIN=60   HammerDB pacing
 #   TC_REFRESH_SEC=1                1-sec TPM counter
+#   FREEZE_TRIGGER_PERCENTAGE=50    ALTER SYSTEM freeze_trigger_percentage (default 50)
 #   BACKUP_DIR=/backup/seekdb       source of the clean snapshot
 #   DATA_DIR=/data/seekdb           live SeekDB volume
 #
@@ -44,6 +45,7 @@ SEEKDB_HOST="${SEEKDB_HOST:-127.0.0.1}"
 SEEKDB_PORT="${SEEKDB_PORT:-2881}"
 SEEKDB_USER="${SEEKDB_USER:-root}"
 SEEKDB_PASS="${SEEKDB_PASS:-password}"
+LOG_DISK_SIZE_MULTIPLIER="${LOG_DISK_SIZE_MULTIPLIER:-3}"
 BACKUP_DIR="${BACKUP_DIR:-/backup/seekdb}"
 DATA_DIR="${DATA_DIR:-/data/seekdb}"
 
@@ -63,10 +65,11 @@ else
     SIZES_GIB=(${SIZES_GIB:-10 30 50 70 90 110})
 fi
 
-NUM_VU="${NUM_VU:-80}"
+NUM_VU="${NUM_VU:-200}"
 RAMPUP_MIN="${RAMPUP_MIN:-10}"
 DURATION_MIN="${DURATION_MIN:-60}"
 TC_REFRESH_SEC="${TC_REFRESH_SEC:-1}"
+FREEZE_TRIGGER_PERCENTAGE="${FREEZE_TRIGGER_PERCENTAGE:-50}"
 
 TS=$(date +%Y%m%d-%H%M%S)
 RESULTS_ROOT="$SCRIPT_DIR/results/$TS-seekdb-$SEEKDB_MODE"
@@ -154,18 +157,24 @@ cgroup_cap_gib() {
     awk -v m="$mem_gib" 'BEGIN{printf "%d", (m*1.25)+0.5}'
 }
 
+log_disk_size_for() {
+    local mem_gib="$1"
+    awk -v m="$mem_gib" -v mult="$LOG_DISK_SIZE_MULTIPLIER" 'BEGIN{printf "%.0fG", m*mult}'
+}
+
 start_seekdb_docker() {
     local mem_gib="$1"
-    local cgroup_gib
+    local cgroup_gib log_disk_size
     cgroup_gib=$(cgroup_cap_gib "$mem_gib")
-    log "Starting $SEEKDB_CONTAINER with MEMORY_LIMIT=${mem_gib}G (cgroup cap=${cgroup_gib}G)"
+    log_disk_size=$(log_disk_size_for "$mem_gib")
+    log "Starting $SEEKDB_CONTAINER with MEMORY_LIMIT=${mem_gib}G LOG_DISK_SIZE=$log_disk_size (cgroup cap=${cgroup_gib}G)"
     docker run -d \
         --name "$SEEKDB_CONTAINER" \
         --restart no \
         --memory "${cgroup_gib}g" \
         --memory-swap "${cgroup_gib}g" \
         -e MEMORY_LIMIT="${mem_gib}G" \
-        -e LOG_DISK_SIZE=32G \
+        -e LOG_DISK_SIZE="$log_disk_size" \
         -e CPU_COUNT=0 \
         -e DATAFILE_MAXSIZE=512G \
         -e ROOT_PASSWORD="$SEEKDB_PASS" \
@@ -193,10 +202,11 @@ start_seekdb_docker() {
 }
 
 write_native_cnf() {
-    # Rewrite /etc/seekdb/seekdb.cnf with the sweep's MEMORY_LIMIT. Other
-    # parameters (base-dir/data-dir/redo-dir/port/log_disk_size/
-    # datafile_maxsize) are stable across iterations.
+    # Rewrite /etc/seekdb/seekdb.cnf with the sweep's per-iteration
+    # MEMORY_LIMIT and derived log_disk_size.
     local mem_gib="$1"
+    local log_disk_size
+    log_disk_size=$(log_disk_size_for "$mem_gib")
     cat > "$SEEKDB_CNF" <<EOF
 base-dir=$DATA_DIR
 data-dir=$DATA_DIR/store
@@ -205,17 +215,18 @@ redo-dir=$DATA_DIR/store/redo
 port=$SEEKDB_PORT
 cpu_count=0
 memory_limit=${mem_gib}G
-log_disk_size=32G
+log_disk_size=$log_disk_size
 datafile_maxsize=512G
 EOF
 }
 
 start_seekdb_native() {
     local mem_gib="$1"
-    local cgroup_gib
+    local cgroup_gib log_disk_size
     cgroup_gib=$(cgroup_cap_gib "$mem_gib")
+    log_disk_size=$(log_disk_size_for "$mem_gib")
     write_native_cnf "$mem_gib"
-    log "Starting native $SEEKDB_SERVICE with MEMORY_LIMIT=${mem_gib}G (cgroup cap=${cgroup_gib}G)"
+    log "Starting native $SEEKDB_SERVICE with MEMORY_LIMIT=${mem_gib}G log_disk_size=$log_disk_size (cgroup cap=${cgroup_gib}G)"
     # systemd's MemoryMax is persistent across daemon-reload but resets
     # at unit reinstall; `--runtime` scopes it to the current boot. We
     # want per-iteration scope, so always re-apply before starting.
@@ -250,26 +261,30 @@ start_seekdb() {
 apply_tuning() {
     # The cnf's memory_limit only applies at first bootstrap — subsequent
     # container/service restarts read the persisted value from the data
-    # dictionary. Force it via ALTER SYSTEM on every iteration so the
-    # sweep's MEMORY_LIMIT actually takes effect.
+    # dictionary. Force them via ALTER SYSTEM on every iteration so restored
+    # snapshots do not keep stale values from the original bootstrap.
     local mem_gib="$1"
-    log "Applying SeekDB tuning (memory_limit=${mem_gib}G)"
+    local log_disk_size
+    log_disk_size=$(log_disk_size_for "$mem_gib")
+    log "Applying SeekDB tuning (memory_limit=${mem_gib}G log_disk_size=$log_disk_size)"
     seekdb_cli -e "ALTER SYSTEM SET memory_limit='${mem_gib}G';" >/dev/null 2>&1 \
         || log "WARN: ALTER SYSTEM SET memory_limit failed"
-    seekdb_cli <<'SQL' >/dev/null 2>&1 || log "WARN: some tuning statements failed"
+    seekdb_cli -e "ALTER SYSTEM SET log_disk_size='$log_disk_size';" >/dev/null 2>&1 \
+        || log "WARN: ALTER SYSTEM SET log_disk_size failed"
+    seekdb_cli <<SQL >/dev/null 2>&1 || log "WARN: some tuning statements failed"
 ALTER SYSTEM SET _enable_defensive_check = FALSE;
 ALTER SYSTEM SET _lcl_op_interval = '0ms';
 ALTER SYSTEM SET syslog_level = 'ERROR';
 ALTER SYSTEM SET micro_block_merge_verify_level = 0;
 CALL DBMS_MONITOR.OB_TENANT_TRACE_DISABLE;
 ALTER SYSTEM SET writing_throttling_trigger_percentage = 100;
-ALTER SYSTEM SET freeze_trigger_percentage = 70;
+ALTER SYSTEM SET freeze_trigger_percentage = ${FREEZE_TRIGGER_PERCENTAGE};
 ALTER SYSTEM SET enable_user_defined_rewrite_rules = TRUE;
 SET GLOBAL ob_query_timeout = 3600000000;
 SQL
 
-    # Verify the value the server now reports matches what we asked for.
-    local actual
+    # Verify the values the server now reports match what we asked for.
+    local actual actual_log_disk
     actual=$(seekdb_cli oceanbase -N -B \
         -e "SELECT value FROM GV\$OB_PARAMETERS WHERE name='memory_limit' LIMIT 1;" 2>/dev/null | head -1)
     if [[ "$actual" != "${mem_gib}G" ]]; then
@@ -277,10 +292,106 @@ SQL
     else
         log "memory_limit verified: ${actual}"
     fi
+    actual_log_disk=$(seekdb_cli oceanbase -N -B \
+        -e "SELECT value FROM GV\$OB_PARAMETERS WHERE name='log_disk_size' LIMIT 1;" 2>/dev/null | head -1)
+    if [[ "$actual_log_disk" != "$log_disk_size" ]]; then
+        log "WARN: log_disk_size reports '$actual_log_disk', expected '$log_disk_size'"
+    else
+        log "log_disk_size verified: ${actual_log_disk}"
+    fi
 
     # memory_limit changes require the server to rebalance internal
     # allocations. Give it a few seconds before hammering it with traffic.
     sleep 10
+}
+
+run_required_sql() {
+    local desc="$1"
+    local db="$2"
+    local sql="$3"
+
+    log "Applying required tuning: $desc"
+    if [[ -n "$db" ]]; then
+        seekdb_cli "$db" -e "$sql" >/dev/null || die "$desc failed"
+    else
+        seekdb_cli -e "$sql" >/dev/null || die "$desc failed"
+    fi
+}
+
+verify_ob_param_value() {
+    local name="$1"
+    local expected="$2"
+    local actual actual_lc expected_lc
+
+    if ! actual=$(seekdb_cli oceanbase -N -B \
+        -e "SELECT value FROM GV\$OB_PARAMETERS WHERE name='${name}' LIMIT 1;" 2>/dev/null | awk 'NR == 1 { print; exit }'); then
+        die "failed to verify parameter $name"
+    fi
+    [[ -n "$actual" ]] || die "parameter $name not found after required tuning"
+
+    actual_lc=$(printf '%s' "$actual" | tr '[:upper:]' '[:lower:]')
+    expected_lc=$(printf '%s' "$expected" | tr '[:upper:]' '[:lower:]')
+    [[ "$actual_lc" == "$expected_lc" ]] \
+        || die "parameter $name reports '$actual', expected '$expected'"
+
+    log "$name verified: $actual"
+}
+
+verify_new_order_table_mode() {
+    local mode create_sql create_lc
+
+    mode=$(seekdb_cli information_schema -N -B \
+        -e "SELECT table_mode FROM tables WHERE table_schema='tpcc' AND table_name='new_order' LIMIT 1;" 2>/dev/null \
+        | awk 'NR == 1 { print; exit }') || true
+    if [[ "$(printf '%s' "$mode" | tr '[:upper:]' '[:lower:]')" == "extreme" ]]; then
+        log "new_order table_mode verified: $mode"
+        return 0
+    fi
+
+    if ! create_sql=$(seekdb_cli tpcc -N -B -e "SHOW CREATE TABLE new_order;" 2>/dev/null); then
+        die "failed to verify new_order table_mode"
+    fi
+    create_lc=$(printf '%s' "$create_sql" | tr '[:upper:]' '[:lower:]')
+    if [[ "$create_lc" == *"table_mode"* && "$create_lc" == *"extreme"* ]]; then
+        log "new_order table_mode verified: Extreme"
+        return 0
+    fi
+
+    die "new_order table_mode is not Extreme after required tuning"
+}
+
+apply_pre_benchmark_tuning() {
+    run_required_sql "new_order table_mode=Extreme" \
+        tpcc "ALTER TABLE new_order SET table_mode = 'Extreme';"
+    run_required_sql "disable adaptive compaction" \
+        "" "ALTER SYSTEM SET _enable_adaptive_compaction = False;"
+    run_required_sql "compaction schedule interval=5s" \
+        "" "ALTER SYSTEM SET ob_compaction_schedule_interval = '5s';"
+    run_required_sql "disable SQL audit" \
+        "" "ALTER SYSTEM SET enable_sql_audit = false;"
+    run_required_sql "disable perf event" \
+        "" "ALTER SYSTEM SET enable_perf_event = false;"
+    run_required_sql "freeze trigger percentage=${FREEZE_TRIGGER_PERCENTAGE}" \
+        "" "ALTER SYSTEM SET freeze_trigger_percentage = ${FREEZE_TRIGGER_PERCENTAGE};"
+    run_required_sql "cpu quota concurrency=20" \
+        "" "ALTER SYSTEM SET cpu_quota_concurrency = 20;"
+    run_required_sql "disable newsort" \
+        "" "ALTER SYSTEM SET _enable_newsort = false;"
+    run_required_sql "default auto increment mode=NOORDER" \
+        "" "ALTER SYSTEM SET default_auto_increment_mode = 'NOORDER';"
+    run_required_sql "enable batched multi statement" \
+        "" "ALTER SYSTEM SET ob_enable_batched_multi_statement = true;"
+
+    verify_new_order_table_mode
+    verify_ob_param_value "_enable_adaptive_compaction" "False"
+    verify_ob_param_value "ob_compaction_schedule_interval" "5s"
+    verify_ob_param_value "enable_sql_audit" "False"
+    verify_ob_param_value "enable_perf_event" "False"
+    verify_ob_param_value "freeze_trigger_percentage" "${FREEZE_TRIGGER_PERCENTAGE}"
+    verify_ob_param_value "cpu_quota_concurrency" "20"
+    verify_ob_param_value "_enable_newsort" "False"
+    verify_ob_param_value "default_auto_increment_mode" "NOORDER"
+    verify_ob_param_value "ob_enable_batched_multi_statement" "True"
 }
 
 # ---------- snapshots ----------
@@ -289,10 +400,14 @@ dump_variables() {
     local path="$1"
     seekdb_cli oceanbase \
         -e "SELECT name, value FROM GV\$OB_PARAMETERS WHERE name IN (
-            'memory_limit','memstore_limit_percentage','freeze_trigger_percentage',
+            'memory_limit','log_disk_size','memstore_limit_percentage','freeze_trigger_percentage',
             'writing_throttling_trigger_percentage','_lcl_op_interval',
             '_enable_defensive_check','micro_block_merge_verify_level',
-            'ob_query_timeout','syslog_level','enable_user_defined_rewrite_rules'
+            'ob_query_timeout','syslog_level','enable_user_defined_rewrite_rules',
+            '_enable_adaptive_compaction','ob_compaction_schedule_interval',
+            'enable_sql_audit','enable_perf_event','cpu_quota_concurrency',
+            '_enable_newsort','default_auto_increment_mode',
+            'ob_enable_batched_multi_statement'
         ) ORDER BY name;" 2>/dev/null > "$path" || true
 }
 
@@ -491,6 +606,8 @@ write_manifest() {
   },
   "tuning": {
     "memory_limit_gib": $size_gib,
+    "log_disk_size": "$(log_disk_size_for "$size_gib")",
+    "log_disk_size_multiplier": $LOG_DISK_SIZE_MULTIPLIER,
     "cgroup_memory_max_gib": $(cgroup_cap_gib "$size_gib")
   },
   "paths": {
@@ -585,7 +702,7 @@ trap 'log "Interrupted"; stop_collectors 2>/dev/null; stop_seekdb; exit 130' INT
 
 log "Sweep start — results under $RESULTS_ROOT"
 log "Sizes (GiB): ${SIZES_GIB[*]}"
-log "VU=$NUM_VU rampup=${RAMPUP_MIN}m duration=${DURATION_MIN}m"
+log "VU=$NUM_VU rampup=${RAMPUP_MIN}m duration=${DURATION_MIN}m freeze_trigger_percentage=$FREEZE_TRIGGER_PERCENTAGE"
 log "Backup:  $BACKUP_DIR"
 log "Datadir: $DATA_DIR"
 
@@ -599,6 +716,7 @@ for size in "${SIZES_GIB[@]}"; do
     drop_os_cache
     start_seekdb "$size"
     apply_tuning "$size"
+    apply_pre_benchmark_tuning
 
     dump_variables     "$iter_dir/seekdb_variables_before.txt"
     dump_tenant_status "$iter_dir/seekdb_status_before.txt"

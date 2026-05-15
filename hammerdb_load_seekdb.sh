@@ -27,22 +27,52 @@ die() { echo "[$(date '+%H:%M:%S')] ERROR: $*" >&2; exit 1; }
 [[ -x "$HAMMERDB_DIR/hammerdbcli" ]] || die "HammerDB not found at $HAMMERDB_DIR"
 [[ -f "$LOAD_TCL" ]]                 || die "Missing $LOAD_TCL"
 
+run_sql() {
+    mysql -h 127.0.0.1 -P 2881 -uroot -ppassword "$@"
+}
+
+wait_for_major_compaction() {
+    local timeout_sec="${MAJOR_FREEZE_TIMEOUT_SEC:-1800}"
+    local poll_sec="${MAJOR_FREEZE_POLL_SEC:-10}"
+    local deadline=$(( $(date +%s) + timeout_sec ))
+    local status=""
+
+    log "Triggering major compaction"
+    run_sql -e "ALTER SYSTEM MAJOR FREEZE;"
+
+    log "Waiting for major compaction to become IDLE (timeout=${timeout_sec}s, poll=${poll_sec}s)"
+    while true; do
+        status=$(run_sql -N -B -e "SELECT STATUS FROM oceanbase.DBA_OB_MAJOR_COMPACTION;" 2>/dev/null | tail -1)
+        if [[ "$status" == "IDLE" ]]; then
+            log "Major compaction completed: STATUS=${status}"
+            return 0
+        fi
+
+        if (( $(date +%s) >= deadline )); then
+            die "major compaction did not become IDLE before timeout (last STATUS='${status:-unknown}')"
+        fi
+
+        log "Major compaction status: ${status:-unknown}; sleeping ${poll_sec}s"
+        sleep "$poll_sec"
+    done
+}
+
 log "Probing SeekDB at 127.0.0.1:2881"
-mysql -h 127.0.0.1 -P 2881 -uroot -ppassword \
-    -e "SELECT VERSION();" >/dev/null 2>&1 \
+run_sql -e "SELECT VERSION();" >/dev/null 2>&1 \
     || die "SeekDB not reachable at 127.0.0.1:2881 (root/password)"
 
 log "Dropping any existing tpcc database"
-mysql -h 127.0.0.1 -P 2881 -uroot -ppassword \
-    -e "DROP DATABASE IF EXISTS tpcc;" 2>/dev/null || true
+run_sql -e "DROP DATABASE IF EXISTS tpcc;" 2>/dev/null || true
 
 log "Running HammerDB build (1000 warehouses, 64 loader VUs, no stored procs)"
 cd "$HAMMERDB_DIR"
 ./hammerdbcli auto "$LOAD_TCL"
 
+wait_for_major_compaction
+
 log "Verifying table row counts (long ob_query_timeout so COUNT(*) on 100M-row tables finishes)"
 for t in warehouse district item customer stock orders new_order order_line history; do
-    n=$(mysql -h 127.0.0.1 -P 2881 -uroot -ppassword tpcc \
+    n=$(run_sql tpcc \
             --init-command="SET SESSION ob_query_timeout=600000000" \
             -N -B -e "SELECT COUNT(*) FROM $t;" 2>/dev/null | tail -1)
     printf "  %-12s %s\n" "$t" "${n:-ERROR}"
