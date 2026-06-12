@@ -2,7 +2,7 @@
 # Sweep SeekDB MEMORY_LIMIT and run HammerDB TPC-C at each setting.
 #
 # SEEKDB_MODE selects how SeekDB is managed:
-#   docker (default)  - docker run against oceanbase/seekdb:latest
+#   docker (default)  - docker run against quay.io/oceanbase/seekdb:latest
 #   native            - systemctl start/stop against the seekdb deb package
 #
 # Per iteration:
@@ -40,7 +40,7 @@ HAMMERDB_DIR="${HAMMERDB_DIR:-/opt/HammerDB-5.0}"
 SEEKDB_MODE="${SEEKDB_MODE:-docker}"
 
 SEEKDB_CONTAINER="${SEEKDB_CONTAINER:-seekdb}"
-SEEKDB_IMAGE="${SEEKDB_IMAGE:-oceanbase/seekdb:latest}"
+SEEKDB_IMAGE="${SEEKDB_IMAGE:-quay.io/oceanbase/seekdb:latest}"
 SEEKDB_HOST="${SEEKDB_HOST:-127.0.0.1}"
 SEEKDB_PORT="${SEEKDB_PORT:-2881}"
 SEEKDB_USER="${SEEKDB_USER:-root}"

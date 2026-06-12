@@ -34,7 +34,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 HAMMERDB_DIR="${HAMMERDB_DIR:-/opt/HammerDB-4.2}"
 SEEKDB_CONTAINER="${SEEKDB_CONTAINER:-seekdb}"
-SEEKDB_IMAGE="${SEEKDB_IMAGE:-oceanbase/seekdb:latest}"
+SEEKDB_IMAGE="${SEEKDB_IMAGE:-quay.io/oceanbase/seekdb:latest}"
 SEEKDB_HOST="${SEEKDB_HOST:-127.0.0.1}"
 SEEKDB_PORT="${SEEKDB_PORT:-2881}"
 SEEKDB_USER="${SEEKDB_USER:-root}"

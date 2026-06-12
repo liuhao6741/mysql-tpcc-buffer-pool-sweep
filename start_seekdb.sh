@@ -17,7 +17,7 @@ docker run -d \
   -e SEEKDB_DATABASE=sbtest \
   -v /data/seekdb:/var/lib/oceanbase \
   --network host \
-  oceanbase/seekdb:latest
+  quay.io/oceanbase/seekdb:latest
 
 # Wait for SeekDB to accept MySQL-protocol connections on 2881.
 # The container entrypoint bootstraps the data dir on first run; that can

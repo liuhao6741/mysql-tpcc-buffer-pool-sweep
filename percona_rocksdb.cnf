@@ -1,0 +1,93 @@
+[mysqld]
+
+# ─── General ───────────────────────────────────────────────────────────────────
+user                            = mysql
+datadir                         = /var/lib/mysql
+socket                          = /var/run/mysqld/mysqld.sock
+pid-file                        = /var/run/mysqld/mysqld.pid
+bind-address                    = 0.0.0.0
+port                            = 3306
+skip-name-resolve               = ON
+mysqlx                          = OFF
+performance_schema              = OFF
+# Percona Server 8.0 still supports mysql_native_password. HammerDB connects
+# without TLS, so avoid caching_sha2_password's secure-channel requirement.
+default_authentication_plugin   = mysql_native_password
+
+# MyRocks needs READ-COMMITTED for HammerDB's SELECT ... FOR UPDATE pattern.
+transaction-isolation           = READ-COMMITTED
+# HammerDB load script explicitly uses ENGINE=ROCKSDB. Keeping the global
+# default unset avoids surprises during first-time datadir initialization.
+# default_storage_engine          = ROCKSDB
+
+# Load MyRocks at startup so restored datadirs containing ROCKSDB tables are
+# usable before the first client connection.
+plugin-load-add                 = rocksdb=ha_rocksdb.so
+
+# ─── Connection & Threading ────────────────────────────────────────────────────
+max_connections                 = 2000
+max_connect_errors              = 1000000
+thread_stack                    = 512K
+thread_cache_size               = 256
+back_log                        = 4096
+wait_timeout                    = 28800
+interactive_timeout             = 28800
+connect_timeout                 = 10
+
+# ─── MyRocks Memory / Compaction ───────────────────────────────────────────────
+# sweep_percona_rocksdb.sh rewrites this value per iteration.
+loose-rocksdb_block_cache_size  = 80G
+
+# Conservative baseline derived from common MyRocks benchmark settings. Most
+# options are loose so the server can still start if a future Percona image
+# renames/removes a setting.
+loose-rocksdb_max_open_files    = -1
+loose-rocksdb_max_background_jobs = 8
+loose-rocksdb_max_total_wal_size = 4G
+loose-rocksdb_block_size        = 16384
+loose-rocksdb_table_cache_numshardbits = 6
+loose-rocksdb_use_direct_reads  = ON
+loose-rocksdb_use_direct_io_for_flush_and_compaction = ON
+loose-rocksdb_bytes_per_sync    = 16777216
+loose-rocksdb_wal_bytes_per_sync = 4194304
+loose-rocksdb_compaction_sequential_deletes_count_sd = 1
+loose-rocksdb_compaction_sequential_deletes = 199999
+loose-rocksdb_compaction_sequential_deletes_window = 200000
+loose-rocksdb_default_cf_options = write_buffer_size=256m;target_file_size_base=32m;max_bytes_for_level_base=512m;max_write_buffer_number=4;level0_file_num_compaction_trigger=4;level0_slowdown_writes_trigger=20;level0_stop_writes_trigger=30;compression=kLZ4Compression;level_compaction_dynamic_level_bytes=true
+
+# ─── Binary Log ────────────────────────────────────────────────────────────────
+log_bin                         = /var/lib/mysql/mysql-bin
+binlog_format                   = ROW
+binlog_row_image                = MINIMAL
+binlog_expire_logs_seconds      = 604800
+sync_binlog                     = 1
+binlog_cache_size               = 4M
+max_binlog_size                 = 512M
+
+# ─── Per-Session Buffers ───────────────────────────────────────────────────────
+sort_buffer_size                = 4M
+join_buffer_size                = 4M
+read_buffer_size                = 2M
+read_rnd_buffer_size            = 4M
+tmp_table_size                  = 256M
+max_heap_table_size             = 256M
+
+# ─── Table & File Handles ──────────────────────────────────────────────────────
+table_open_cache                = 65536
+table_definition_cache          = 65536
+open_files_limit                = 1000000
+
+# ─── Character Set / Misc ──────────────────────────────────────────────────────
+character_set_server            = utf8mb4
+collation_server                = utf8mb4_unicode_ci
+max_allowed_packet              = 64M
+bulk_insert_buffer_size         = 256M
+key_buffer_size                 = 64M
+
+[mysqldump]
+quick
+max_allowed_packet              = 64M
+
+[client]
+socket                          = /var/run/mysqld/mysqld.sock
+default-character-set           = utf8mb4
